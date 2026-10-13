@@ -1,0 +1,10 @@
+*.pdb
+*.lib
+*.obj
+*.exp
+.vs/
+build/
+*.log
+dist/
+assets/*.png
+assets/*.ico
