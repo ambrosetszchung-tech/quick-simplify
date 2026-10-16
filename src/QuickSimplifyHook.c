@@ -68,21 +68,30 @@ static HRESULT WINAPI ProbeSetText(void* self,DWORD cookie,DWORD flags,const WCH
     }
     return originalSetText(self,cookie,flags,text,length);
 }
-static BOOL MatchedModule(HMODULE module){
-    BYTE expected[]={0xa7,0xc0,0xa2,0x34,0x23,0xda,0x2e,0x21,0x70,0x02,0x41,0x81,0xad,0xfb,0x5b,0x3c};
+static DWORD SetTextRvaForModule(HMODULE module){
+    // These CodeView identities and RVAs are paired. A new Windows build must
+    // be analyzed before its private CRange::_SetText entry can be hooked.
+    static const struct { BYTE guid[16]; DWORD age, rva; } versions[]={
+        {{0xa7,0xc0,0xa2,0x34,0x23,0xda,0x2e,0x21,0x70,0x02,0x41,0x81,0xad,0xfb,0x5b,0x3c},1,0x2aed8},
+        {{0xdd,0x43,0x23,0x60,0x1c,0x7a,0x8e,0x98,0x2e,0x58,0x53,0x78,0xba,0xc5,0x77,0x0a},1,0x2ad58}
+    };
     BYTE* base=(BYTE*)module;IMAGE_DOS_HEADER* dos=(IMAGE_DOS_HEADER*)base;
-    if(dos->e_magic!=IMAGE_DOS_SIGNATURE)return FALSE;
+    if(dos->e_magic!=IMAGE_DOS_SIGNATURE)return 0;
     IMAGE_NT_HEADERS64* nt=(IMAGE_NT_HEADERS64*)(base+dos->e_lfanew);
-    if(nt->Signature!=IMAGE_NT_SIGNATURE||nt->OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC)return FALSE;
+    if(nt->Signature!=IMAGE_NT_SIGNATURE||nt->OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC)return 0;
     IMAGE_DATA_DIRECTORY directory=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if(!directory.VirtualAddress||directory.Size<sizeof(IMAGE_DEBUG_DIRECTORY))return 0;
     IMAGE_DEBUG_DIRECTORY* debug=(IMAGE_DEBUG_DIRECTORY*)(base+directory.VirtualAddress);
     for(DWORD i=0;i<directory.Size/sizeof(*debug);i++){
         if(debug[i].Type==IMAGE_DEBUG_TYPE_CODEVIEW&&debug[i].SizeOfData>=24){
             BYTE* cv=base+debug[i].AddressOfRawData;
-            if(memcmp(cv,"RSDS",4)==0&&memcmp(cv+4,expected,16)==0&&*(DWORD*)(cv+20)==1)return TRUE;
+            if(memcmp(cv,"RSDS",4)!=0)continue;
+            for(DWORD j=0;j<sizeof(versions)/sizeof(versions[0]);j++)
+                if(memcmp(cv+4,versions[j].guid,16)==0&&*(DWORD*)(cv+20)==versions[j].age)
+                    return versions[j].rva;
         }
     }
-    return FALSE;
+    return 0;
 }
 static HRESULT ActivateOwnQuick(void){
     typedef HRESULT (WINAPI *CREATE)(void**);
@@ -111,7 +120,8 @@ static void BeginOnce(void){
     if(state->stop){if(initialized==1){MH_DisableHook(MH_ALL_HOOKS);MH_Uninitialize();initialized=2;}state->state=90;return;}
     HMODULE module=GetModuleHandleW(L"TextInputFramework.dll");if(!module)return;
     if(InterlockedCompareExchange(&initialized,1,0)!=0)return;
-    if(!MatchedModule(module)){state->state=20;return;}
+    DWORD setTextRva=SetTextRvaForModule(module);
+    if(!setTextRva){state->state=20;return;}
     if(state->production==1){QuickActive();}else{state->activationHr=ActivateOwnQuick();}
     state->keyboardLayout=(DWORD)(ULONG_PTR)GetKeyboardLayout(0);
     HWND focus=GetFocus();
@@ -133,9 +143,9 @@ static void BeginOnce(void){
         }
     }
     MH_STATUS init=MH_Initialize();if(init!=MH_OK){state->state=30+init;return;}
-    MH_STATUS create=MH_CreateHook((BYTE*)module+0x2aed8,(void*)ProbeSetText,(void**)&originalSetText);
+    MH_STATUS create=MH_CreateHook((BYTE*)module+setTextRva,(void*)ProbeSetText,(void**)&originalSetText);
     if(create!=MH_OK){state->state=50+create;return;}
-    MH_STATUS enable=MH_EnableHook((BYTE*)module+0x2aed8);
+    MH_STATUS enable=MH_EnableHook((BYTE*)module+setTextRva);
     state->state=enable==MH_OK?1:70+enable;
 }
 __declspec(dllexport) LRESULT CALLBACK ProbeMessageHook(int code,WPARAM w,LPARAM l){if(code>=0)BeginOnce();return CallNextHookEx(NULL,code,w,l);}
